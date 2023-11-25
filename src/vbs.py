@@ -9,7 +9,7 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-def main(in_file_name, p, out_file_name, verbose, track_time):
+def main(in_file_name, p, bin_num, out_file_name, verbose, track_time):
     data = None
     dims = None
     spacing = None
@@ -19,8 +19,6 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
     split_sizes = None
     split_sizes_input = None
     disp_input = None
-    split_sizes_output = None
-    disp_output = None
 
     start_time = None
     reading_time = None
@@ -70,9 +68,6 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
         split_sizes_input = split_sizes * dims[1] * dims[2]
         disp_input = np.insert(np.cumsum(split_sizes_input),0,0)[0:-1]
 
-        split_sizes_output = split_sizes * dims[1] * dims[2]
-        disp_output = np.insert(np.cumsum(split_sizes_input),0,0)[0:-1]
-
     # Broadcasting dimensions to calculate length of receiving buffer
     # Broadcasting metadata, split sizes and displacements
     dims = comm.bcast(dims, root=0)
@@ -108,13 +103,13 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
         print("Rank:", rank)
         print(f"recvbuf.dtype: {recvbuf.dtype}, recvbuf.shape: {recvbuf.shape}, recvbuf.size: {recvbuf.size}")
         print(flush=True)
-
+    
     comm.Barrier()
     comm.Scatterv([data, split_sizes_input, disp_input, MPI.DOUBLE], recvbuf, root=0)
 
     if (track_time == True) and (rank == 0):
         scatter_time = MPI.Wtime()
-    
+
     if rank == 0:
         print("Scattered the data")
         print(flush=True)
@@ -125,8 +120,56 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
         print(flush=True)
     # comm.Scatterv(data, recvbuf, root=0)
 
-    # Simple random sampling
-    recvbuf = simple_rs(recvbuf, p)
+    # Calculating ranges of bins
+    max_val = np.max(recvbuf)
+    min_val = np.min(recvbuf)
+
+    max_val = comm.allreduce(max_val, op=MPI.MAX)
+    min_val = comm.allreduce(min_val, op=MPI.MIN)
+
+    # Creating the bin boundries
+    min_arr = np.linspace(min_val, max_val, bin_num+1)[:-1]
+    max_arr = np.linspace(min_val, max_val, bin_num+1)[1:]
+
+    # Getting the frequency distribution
+    bin_counts = freq_count(recvbuf, min_arr, max_arr)
+
+    if verbose == True:
+        print(f"Rank {rank}:")
+        print("Minimum bounds:", min_arr)
+        print("Maximum bounds:", max_arr)
+        print("Local bin counts:", bin_counts)
+        print(flush=True)
+
+    # Reducing the frequency distribution to get the global distribution
+    bin_counts = np.array(bin_counts, order='C', dtype='int')
+    global_bin_counts = bin_counts.astype('int', order='C')
+
+    comm.Allreduce(bin_counts, global_bin_counts, op=MPI.SUM)
+
+    if rank == 0:
+        print("Counts of data in each bin")
+        print(global_bin_counts)
+        print(flush=True)
+
+    # Calculating the sampling probabilities at all nodes
+    imp_fn = get_val_imp_fn(global_bin_counts, bin_num, length, p)
+
+    if rank == 0:
+        print(f"Importance function:")
+        print(imp_fn)
+        print(flush=True)
+
+    # Value based random sampling
+    bin_freq, samp_freq = value_bs(recvbuf, min_arr, max_arr, imp_fn)
+
+    if verbose == True:
+        print(f"Rank {rank}:")
+        print("Number of elements in each bin:")
+        print(bin_freq)
+        print("Number of elements sampled from each bin:")
+        print(samp_freq)
+        print(flush=True)
 
     # Get coordinates values of sampled data
     coord_disps = np.insert(np.cumsum(split_sizes), 0, 0)[0: -1] * spacing[0]
@@ -137,7 +180,7 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
         print(f"Rank: {rank}")
         print(f"Starting x-coordinates: {coord_disps[rank]}")
         print(flush=True)
-    
+
     if (track_time == True) and (rank == 0):
         comp_time = MPI.Wtime()
 
@@ -217,7 +260,6 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
         # Some sampling information
         sampled_length = final_coords.shape[0]
         print(f"{sampled_length} sampled out of {length} data points. Sampling rate: {sampled_length/length}")
-        print(flush=True)
 
         if track_time == True:
             total_time = saving_time - start_time
@@ -235,12 +277,8 @@ def main(in_file_name, p, out_file_name, verbose, track_time):
             print("saving_time:", saving_time)
             print("total_time:", total_time)
 
-            with open("srs_time.csv", 'a') as f:
-                f.write(f"{size},{p},{reading_time},{scatter_time},{comp_time},{gather_time},{saving_time},{total_time}\n")
-
-
-    # # Gathering the data
-    # comm.Gatherv(recvbuf, [final_data, split_sizes_input, disp_input, MPI.FLOAT], root=0)
+            with open("vbs_time.csv", 'a') as f:
+                f.write(f"{size},{bin_num},{p},{reading_time},{scatter_time},{comp_time},{gather_time},{saving_time},{total_time}\n")
 
     # if rank == 0:
     #     print("Gathered everything")
@@ -264,17 +302,21 @@ if __name__ == '__main__':
     parser.add_option("-r", "--sampling-ratio", dest="prob", type="float", default="0.001",
         help="sampling ratio between 0 and 1 [default: %default]", metavar="FLOAT")
     
-    parser.add_option("-o", "--out-file", dest="out_file", type="string", default="out_srs.vtp",
+    parser.add_option("-b", "--bin-num", dest="bin_num", type="int", default="16",
+        help="number of bins [default: %default]", metavar="INT")
+    
+    parser.add_option("-o", "--out-file", dest="out_file", type="string", default="out_gbs.vtp",
         help="name of output vtp file [default: %default]", metavar="FILE_NAME")
     
     parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,
         help="detailed log")
     
     parser.add_option("-t", "--track-time", dest="track_time", action="store_true", default=False,
-        help="Append to srs_time.csv in format: proc_num,reading_time,scatter_time,comp_time,gather_time,saving_time,total_time")
+        help="Append to vbs_time.csv in format: proc_num,reading_time,scatter_time,comp_time,gather_time,saving_time,total_time")
     
     options, args = parser.parse_args()
     prob = options.prob
+    bin_num = options.bin_num
     out_file = options.out_file
     verbose = options.verbose
     track_time = options.track_time
@@ -287,12 +329,13 @@ if __name__ == '__main__':
     if verbose==True and rank == 0:
         print("Arguments:")
         print("prob:", prob)
+        print("bin_num:", bin_num)
         print("out_file:", out_file)
         print("in_file:", in_file)
         print("verbose:", verbose)
         print("track_time:", track_time)
         print(flush=True)
 
-    main(in_file, p=options.prob, out_file_name=out_file, verbose=verbose, track_time=track_time)
+    main(in_file, p=options.prob, bin_num=options.bin_num, out_file_name=out_file, verbose=verbose, track_time=track_time)
 
 MPI.Finalize()
